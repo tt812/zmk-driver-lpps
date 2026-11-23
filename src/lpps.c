@@ -17,6 +17,10 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/atomic.h>
 
+#if __has_include(<zmk/keymap.h>)
+#include <zmk/keymap.h>
+#endif
+
 LOG_MODULE_REGISTER(lpps, CONFIG_ZMK_LOG_LEVEL);
 
 #define DT_DRV_COMPAT lpps
@@ -36,6 +40,14 @@ struct lpps_data {
     struct gpio_callback motion_cb;
     atomic_t behavior_calibration_pending;
 };
+
+static bool lpps_is_scroll_layer_active(void) {
+#if __has_include(<zmk/keymap.h>)
+    return zmk_keymap_layer_active(6);
+#else
+    return false;
+#endif
+}
 
 static int lpps_i2c_read_reg(const struct device *dev, uint8_t reg, uint8_t *data, uint8_t len) {
     const struct lpps_config *cfg = dev->config;
@@ -164,10 +176,11 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     LOG_DBG("Movement: x=%4d y=%4d z=%4d", x, y, z);
 
-    /* Stabilized streak-gated deadzone, anti-rebound smoothing, and axis inversion */
+    /* Continuous tracking smoothing, orthogonal scroll lock, and axis inversion */
     static int64_t last_active_time = 0;
     static int64_t last_sample_time = 0;
     static uint8_t streak_count = 0;
+    static int8_t locked_axis = 0;
     static int32_t ema_x = 0;
     static int32_t ema_y = 0;
     static int32_t rem_x = 0;
@@ -175,12 +188,12 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     int32_t mag = abs(x) + abs(y);
 
-    if ((current_time - last_sample_time) > 60) {
+    if ((current_time - last_sample_time) > 100) {
         streak_count = 0;
     }
     last_sample_time = current_time;
 
-    if (mag >= 2) {
+    if (mag >= 1) {
         if (streak_count < 10) {
             streak_count++;
         }
@@ -188,30 +201,31 @@ static void lpps_motion_work_handler(struct k_work *work) {
         streak_count = 0;
     }
 
-    bool is_moving = (current_time - last_active_time) <= 70;
+    bool is_moving = (current_time - last_active_time) <= 180;
 
     if (!is_moving) {
         ema_x = 0;
         ema_y = 0;
         rem_x = 0;
         rem_y = 0;
+        locked_axis = 0;
 
-        /* Require either a clear push (mag >= 3) or 2 consecutive valid samples */
+        /* Ignore idle single-count noise; start on clear push or 2 consecutive samples */
         if (mag < 3 && streak_count < 2) {
             lpps_interrupt_enable_when_inactive(data);
             return;
         }
 
-        /* Pre-charge filter on start so initial response has zero lag */
+        /* Pre-charge filter on start for immediate, lag-free response */
         ema_x = (int32_t)x * 16;
         ema_y = (int32_t)y * 16;
     } else {
-        /* 16x fixed-point EMA (75% previous + 25% current) for smooth diagonals */
-        ema_x = (ema_x * 3 + (int32_t)x * 16) / 4;
-        ema_y = (ema_y * 3 + (int32_t)y * 16) / 4;
+        /* 16x fixed-point EMA (62.5% previous + 37.5% current) */
+        ema_x = (ema_x * 5 + (int32_t)x * 16 * 3) / 8;
+        ema_y = (ema_y * 5 + (int32_t)y * 16 * 3) / 8;
     }
 
-    if (mag >= 2) {
+    if (mag >= 1) {
         last_active_time = current_time;
     }
 
@@ -221,6 +235,25 @@ static void lpps_motion_work_handler(struct k_work *work) {
     int32_t out_y = total_y / 16;
     rem_x = total_x - (out_x * 16);
     rem_y = total_y - (out_y * 16);
+
+    /* Lock scroll to strictly horizontal or vertical on layer 6 */
+    if (lpps_is_scroll_layer_active()) {
+        int32_t ax = abs(out_x);
+        int32_t ay = abs(out_y);
+        if (ax > ay) {
+            locked_axis = 1;
+        } else if (ay > ax) {
+            locked_axis = 2;
+        }
+
+        if (locked_axis == 1) {
+            out_y = 0;
+        } else if (locked_axis == 2) {
+            out_x = 0;
+        }
+    } else {
+        locked_axis = 0;
+    }
 
     if (out_x != 0 || out_y != 0) {
         /* Invert both X and Y directions */
