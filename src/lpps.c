@@ -43,7 +43,7 @@ struct lpps_data {
 
 static bool lpps_is_scroll_layer_active(void) {
 #if __has_include(<zmk/keymap.h>)
-    return zmk_keymap_layer_active(6);
+    return zmk_keymap_layer_active(12);
 #else
     return false;
 #endif
