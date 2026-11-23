@@ -176,15 +176,17 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     LOG_DBG("Movement: x=%4d y=%4d z=%4d", x, y, z);
 
-    /* Continuous tracking smoothing, orthogonal scroll lock, and axis inversion */
+    /* Synchronized vector accumulation (anti-zigzag), orthogonal scroll, and axis inversion */
+    const int32_t SCALE = 16;
     static int64_t last_active_time = 0;
     static int64_t last_sample_time = 0;
+    static uint16_t active_samples = 0;
     static uint8_t streak_count = 0;
     static int8_t locked_axis = 0;
     static int32_t ema_x = 0;
     static int32_t ema_y = 0;
-    static int32_t rem_x = 0;
-    static int32_t rem_y = 0;
+    static int32_t acc_x = 0;
+    static int32_t acc_y = 0;
 
     int32_t mag = abs(x) + abs(y);
 
@@ -206,8 +208,9 @@ static void lpps_motion_work_handler(struct k_work *work) {
     if (!is_moving) {
         ema_x = 0;
         ema_y = 0;
-        rem_x = 0;
-        rem_y = 0;
+        acc_x = 0;
+        acc_y = 0;
+        active_samples = 0;
         locked_axis = 0;
 
         /* Ignore idle single-count noise; start on clear push or 2 consecutive samples */
@@ -215,41 +218,66 @@ static void lpps_motion_work_handler(struct k_work *work) {
             lpps_interrupt_enable_when_inactive(data);
             return;
         }
-
-        /* Pre-charge filter on start for immediate, lag-free response */
-        ema_x = (int32_t)x * 16;
-        ema_y = (int32_t)y * 16;
-    } else {
-        /* 16x fixed-point EMA (62.5% previous + 37.5% current) */
-        ema_x = (ema_x * 5 + (int32_t)x * 16 * 3) / 8;
-        ema_y = (ema_y * 5 + (int32_t)y * 16 * 3) / 8;
     }
 
     if (mag >= 1) {
         last_active_time = current_time;
     }
 
-    int32_t total_x = ema_x + rem_x;
-    int32_t total_y = ema_y + rem_y;
-    int32_t out_x = total_x / 16;
-    int32_t out_y = total_y / 16;
-    rem_x = total_x - (out_x * 16);
-    rem_y = total_y - (out_y * 16);
+    active_samples++;
+    if (active_samples == 1) {
+        ema_x = (int32_t)x * SCALE;
+        ema_y = (int32_t)y * SCALE;
+    } else if (active_samples <= 3) {
+        /* Equalize initial alternating (X,0)/(0,Y) samples before first output */
+        ema_x = (ema_x * (active_samples - 1) + (int32_t)x * SCALE) / active_samples;
+        ema_y = (ema_y * (active_samples - 1) + (int32_t)y * SCALE) / active_samples;
+    } else {
+        /* Strong low-pass EMA (87.5% previous + 12.5% current) to absorb step alternation */
+        ema_x = (ema_x * 7 + (int32_t)x * SCALE) / 8;
+        ema_y = (ema_y * 7 + (int32_t)y * SCALE) / 8;
+    }
+
+    acc_x += ema_x;
+    acc_y += ema_y;
+
+    bool scroll_active = lpps_is_scroll_layer_active();
+
+    /* Hold output until 3 pixels accumulate on cursor mode so X & Y emit together as a diagonal */
+    int32_t min_step = scroll_active ? SCALE : (3 * SCALE);
+
+    if (abs(acc_x) < min_step && abs(acc_y) < min_step) {
+        lpps_interrupt_enable_when_inactive(data);
+        return;
+    }
+
+    int32_t out_x = acc_x / SCALE;
+    int32_t out_y = acc_y / SCALE;
+    acc_x -= out_x * SCALE;
+    acc_y -= out_y * SCALE;
 
     /* Lock scroll to strictly horizontal or vertical on layer 6 */
-    if (lpps_is_scroll_layer_active()) {
+    if (scroll_active) {
         int32_t ax = abs(out_x);
         int32_t ay = abs(out_y);
-        if (ax > ay) {
-            locked_axis = 1;
-        } else if (ay > ax) {
+        if (locked_axis == 0) {
+            if (ax > ay) {
+                locked_axis = 1;
+            } else if (ay > ax) {
+                locked_axis = 2;
+            }
+        } else if (locked_axis == 1 && ay > ax * 2) {
             locked_axis = 2;
+        } else if (locked_axis == 2 && ax > ay * 2) {
+            locked_axis = 1;
         }
 
         if (locked_axis == 1) {
             out_y = 0;
+            acc_y = 0;
         } else if (locked_axis == 2) {
             out_x = 0;
+            acc_x = 0;
         }
     } else {
         locked_axis = 0;
