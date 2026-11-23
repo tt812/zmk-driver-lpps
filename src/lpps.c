@@ -164,14 +164,31 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     LOG_DBG("Movement: x=%4d y=%4d z=%4d", x, y, z);
 
-    /* Vector deadzone, diagonal-preserving smoothing, and axis inversion */
+    /* Stabilized streak-gated deadzone, anti-rebound smoothing, and axis inversion */
     static int64_t last_active_time = 0;
+    static int64_t last_sample_time = 0;
+    static uint8_t streak_count = 0;
     static int32_t ema_x = 0;
     static int32_t ema_y = 0;
     static int32_t rem_x = 0;
     static int32_t rem_y = 0;
 
-    bool is_moving = (current_time - last_active_time) <= 120;
+    int32_t mag = abs(x) + abs(y);
+
+    if ((current_time - last_sample_time) > 60) {
+        streak_count = 0;
+    }
+    last_sample_time = current_time;
+
+    if (mag >= 2) {
+        if (streak_count < 10) {
+            streak_count++;
+        }
+    } else {
+        streak_count = 0;
+    }
+
+    bool is_moving = (current_time - last_active_time) <= 70;
 
     if (!is_moving) {
         ema_x = 0;
@@ -179,27 +196,31 @@ static void lpps_motion_work_handler(struct k_work *work) {
         rem_x = 0;
         rem_y = 0;
 
-        /* Ignore idle noise when both axes are within +/- 1 */
-        if (abs(x) <= 1 && abs(y) <= 1) {
+        /* Require either a clear push (mag >= 3) or 2 consecutive valid samples */
+        if (mag < 3 && streak_count < 2) {
             lpps_interrupt_enable_when_inactive(data);
             return;
         }
+
+        /* Pre-charge filter on start so initial response has zero lag */
+        ema_x = (int32_t)x * 16;
+        ema_y = (int32_t)y * 16;
+    } else {
+        /* 16x fixed-point EMA (75% previous + 25% current) for smooth diagonals */
+        ema_x = (ema_x * 3 + (int32_t)x * 16) / 4;
+        ema_y = (ema_y * 3 + (int32_t)y * 16) / 4;
     }
 
-    if (x != 0 || y != 0) {
+    if (mag >= 2) {
         last_active_time = current_time;
     }
 
-    /* Smooth alternating (X,0)/(0,Y) reports into true diagonal vectors (8x fixed-point) */
-    ema_x = (ema_x * 3 + (int32_t)x * 8) / 4;
-    ema_y = (ema_y * 3 + (int32_t)y * 8) / 4;
-
     int32_t total_x = ema_x + rem_x;
     int32_t total_y = ema_y + rem_y;
-    int32_t out_x = total_x / 8;
-    int32_t out_y = total_y / 8;
-    rem_x = total_x - (out_x * 8);
-    rem_y = total_y - (out_y * 8);
+    int32_t out_x = total_x / 16;
+    int32_t out_y = total_y / 16;
+    rem_x = total_x - (out_x * 16);
+    rem_y = total_y - (out_y * 16);
 
     if (out_x != 0 || out_y != 0) {
         /* Invert both X and Y directions */
