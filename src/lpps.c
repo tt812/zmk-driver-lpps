@@ -164,38 +164,47 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     LOG_DBG("Movement: x=%4d y=%4d z=%4d", x, y, z);
 
-    /* Deadzone (single-count noise removal) and smoothing filter */
-    static int64_t last_event_time = 0;
-    static int16_t ema_x = 0;
-    static int16_t ema_y = 0;
-    static int16_t rem_x = 0;
-    static int16_t rem_y = 0;
+    /* Vector deadzone, diagonal-preserving smoothing, and axis inversion */
+    static int64_t last_active_time = 0;
+    static int32_t ema_x = 0;
+    static int32_t ema_y = 0;
+    static int32_t rem_x = 0;
+    static int32_t rem_y = 0;
 
-    if ((current_time - last_event_time) > 100) {
+    bool is_moving = (current_time - last_active_time) <= 120;
+
+    if (!is_moving) {
         ema_x = 0;
         ema_y = 0;
         rem_x = 0;
         rem_y = 0;
+
+        /* Ignore idle noise when both axes are within +/- 1 */
+        if (abs(x) <= 1 && abs(y) <= 1) {
+            lpps_interrupt_enable_when_inactive(data);
+            return;
+        }
     }
-    last_event_time = current_time;
 
-    const int8_t deadzone = 1;
-    int16_t dx = (abs(x) <= deadzone) ? 0 : x;
-    int16_t dy = (abs(y) <= deadzone) ? 0 : y;
+    if (x != 0 || y != 0) {
+        last_active_time = current_time;
+    }
 
-    ema_x = (ema_x + dx * 4) / 2;
-    ema_y = (ema_y + dy * 4) / 2;
+    /* Smooth alternating (X,0)/(0,Y) reports into true diagonal vectors (8x fixed-point) */
+    ema_x = (ema_x * 3 + (int32_t)x * 8) / 4;
+    ema_y = (ema_y * 3 + (int32_t)y * 8) / 4;
 
-    int16_t total_x = ema_x + rem_x;
-    int16_t total_y = ema_y + rem_y;
-    int16_t out_x = total_x / 4;
-    int16_t out_y = total_y / 4;
-    rem_x = total_x - (out_x * 4);
-    rem_y = total_y - (out_y * 4);
+    int32_t total_x = ema_x + rem_x;
+    int32_t total_y = ema_y + rem_y;
+    int32_t out_x = total_x / 8;
+    int32_t out_y = total_y / 8;
+    rem_x = total_x - (out_x * 8);
+    rem_y = total_y - (out_y * 8);
 
     if (out_x != 0 || out_y != 0) {
-        input_report_rel(dev, INPUT_REL_X, out_x, false, K_FOREVER);
-        input_report_rel(dev, INPUT_REL_Y, out_y, true, K_FOREVER);
+        /* Invert both X and Y directions */
+        input_report_rel(dev, INPUT_REL_X, -out_x, false, K_FOREVER);
+        input_report_rel(dev, INPUT_REL_Y, -out_y, true, K_FOREVER);
     }
 
     lpps_interrupt_enable_when_inactive(data);
