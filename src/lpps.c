@@ -176,8 +176,9 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     LOG_DBG("Movement: x=%4d y=%4d z=%4d", x, y, z);
 
-    /* Synchronized vector accumulation (anti-zigzag), orthogonal scroll, and axis inversion */
+    /* Delayed-activation deadzone, synchronized vector accumulation, orthogonal scroll, and axis inversion */
     const int32_t SCALE = 16;
+    const uint8_t REQUIRED_STREAK = 4;
     static int64_t last_active_time = 0;
     static int64_t last_sample_time = 0;
     static uint16_t active_samples = 0;
@@ -190,20 +191,20 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     int32_t mag = abs(x) + abs(y);
 
-    if ((current_time - last_sample_time) > 100) {
+    if ((current_time - last_sample_time) > 80) {
         streak_count = 0;
     }
     last_sample_time = current_time;
 
-    if (mag >= 1) {
-        if (streak_count < 10) {
+    if (mag >= 2) {
+        if (streak_count < 20) {
             streak_count++;
         }
     } else {
         streak_count = 0;
     }
 
-    bool is_moving = (current_time - last_active_time) <= 180;
+    bool is_moving = (current_time - last_active_time) <= 150;
 
     if (!is_moving) {
         ema_x = 0;
@@ -213,8 +214,8 @@ static void lpps_motion_work_handler(struct k_work *work) {
         active_samples = 0;
         locked_axis = 0;
 
-        /* Ignore idle single-count noise; start on clear push or 2 consecutive samples */
-        if (mag < 3 && streak_count < 2) {
+        /* Require sustained input (REQUIRED_STREAK consecutive samples) before activating */
+        if (streak_count < REQUIRED_STREAK) {
             lpps_interrupt_enable_when_inactive(data);
             return;
         }
@@ -243,8 +244,8 @@ static void lpps_motion_work_handler(struct k_work *work) {
 
     bool scroll_active = lpps_is_scroll_layer_active();
 
-    /* Hold output until 3 pixels accumulate on cursor mode so X & Y emit together as a diagonal */
-    int32_t min_step = scroll_active ? SCALE : (3 * SCALE);
+    /* Hold output until 4 pixels accumulate on cursor mode so tiny tremor never triggers layer 5 */
+    int32_t min_step = scroll_active ? SCALE : (4 * SCALE);
 
     if (abs(acc_x) < min_step && abs(acc_y) < min_step) {
         lpps_interrupt_enable_when_inactive(data);
