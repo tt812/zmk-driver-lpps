@@ -163,8 +163,40 @@ static void lpps_motion_work_handler(struct k_work *work) {
     ret = lpps_i2c_read_reg(dev, 0, transfer_bytes, 1);
 
     LOG_DBG("Movement: x=%4d y=%4d z=%4d", x, y, z);
-    input_report_rel(dev, INPUT_REL_X, x, false, K_FOREVER);
-    input_report_rel(dev, INPUT_REL_Y, y, true, K_FOREVER);
+
+    /* Deadzone (single-count noise removal) and smoothing filter */
+    static int64_t last_event_time = 0;
+    static int16_t ema_x = 0;
+    static int16_t ema_y = 0;
+    static int16_t rem_x = 0;
+    static int16_t rem_y = 0;
+
+    if ((current_time - last_event_time) > 100) {
+        ema_x = 0;
+        ema_y = 0;
+        rem_x = 0;
+        rem_y = 0;
+    }
+    last_event_time = current_time;
+
+    const int8_t deadzone = 1;
+    int16_t dx = (abs(x) <= deadzone) ? 0 : x;
+    int16_t dy = (abs(y) <= deadzone) ? 0 : y;
+
+    ema_x = (ema_x + dx * 4) / 2;
+    ema_y = (ema_y + dy * 4) / 2;
+
+    int16_t total_x = ema_x + rem_x;
+    int16_t total_y = ema_y + rem_y;
+    int16_t out_x = total_x / 4;
+    int16_t out_y = total_y / 4;
+    rem_x = total_x - (out_x * 4);
+    rem_y = total_y - (out_y * 4);
+
+    if (out_x != 0 || out_y != 0) {
+        input_report_rel(dev, INPUT_REL_X, out_x, false, K_FOREVER);
+        input_report_rel(dev, INPUT_REL_Y, out_y, true, K_FOREVER);
+    }
 
     lpps_interrupt_enable_when_inactive(data);
 }
